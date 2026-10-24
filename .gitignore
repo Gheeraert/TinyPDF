@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+assets/tinypdf.ico
+.idea/
+.venv-build/

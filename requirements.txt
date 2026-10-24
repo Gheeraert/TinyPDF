@@ -1,0 +1,3 @@
+PySide6-Essentials>=6.7
+# PyMuPDF 2.x impose numpy, onnxruntime, networkx… (+60 Mo inutiles ici).
+PyMuPDF>=1.25,<2
