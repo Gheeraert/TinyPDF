@@ -7,7 +7,8 @@ Principes de sécurité :
   l'enregistrement ;
 - l'enregistrement est incrémental quand c'est possible (le fichier d'origine
   est recopié à l'identique, les ajouts sont écrits à la suite), ce qui
-  préserve la structure et les éventuelles signatures électroniques ;
+  préserve la structure et les éventuelles signatures électroniques ; une
+  page tournée, supprimée ou insérée force une reconstruction complète ;
 - l'écriture passe par un fichier temporaire remplacé atomiquement : en cas
   d'échec, la cible n'est jamais laissée à moitié écrite.
 """
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -28,6 +30,21 @@ from .stamping import BlockRenderer, Placement, apply_placements
 # le déchiffrement du document. On ne le consulte donc qu'avant authentification.
 
 
+@dataclass
+class PageSlot:
+    """Une page du document affiché : d'où elle vient, et sa rotation ajoutée.
+
+    source == 0 désigne le document d'origine ; un autre entier désigne un PDF
+    inséré (clé dans PdfDocument._extra_sources). base_rotation est la rotation
+    de la page au moment où elle est entrée dans le plan ; rotation_delta est
+    ce que l'utilisateur y a ajouté depuis (multiple de 90).
+    """
+    source: int
+    index: int
+    base_rotation: int
+    rotation_delta: int = 0
+
+
 class PdfError(Exception):
     """Erreur présentable telle quelle à l'utilisateur."""
 
@@ -38,6 +55,13 @@ class PdfDocument:
         self._data = data
         self.doc = doc
         self._password = password
+        self._extra_docs: dict[int, fitz.Document] = {}
+        self._extra_sources: dict[int, bytes] = {}
+        self._next_source = 1
+        self._plan: list[PageSlot] = [
+            PageSlot(source=0, index=i, base_rotation=doc[i].rotation)
+            for i in range(doc.page_count)
+        ]
 
     # -- ouverture ------------------------------------------------------------
 
@@ -73,6 +97,8 @@ class PdfDocument:
 
     def close(self) -> None:
         self.doc.close()
+        for extra in self._extra_docs.values():
+            extra.close()
 
     # -- informations ---------------------------------------------------------
 
@@ -82,11 +108,27 @@ class PdfDocument:
 
     @property
     def page_count(self) -> int:
-        return self.doc.page_count
+        return len(self._plan)
+
+    @property
+    def is_edited(self) -> bool:
+        """True si l'ordre, le nombre ou la rotation des pages a changé."""
+        if self._extra_docs or len(self._plan) != self.doc.page_count:
+            return True
+        return any(slot.source != 0 or slot.index != i or slot.rotation_delta % 360
+                   for i, slot in enumerate(self._plan))
+
+    def _slot_page(self, slot: PageSlot) -> fitz.Page:
+        d = self.doc if slot.source == 0 else self._extra_docs[slot.source]
+        page = d[slot.index]
+        effective = (slot.base_rotation + slot.rotation_delta) % 360
+        if page.rotation != effective:
+            page.set_rotation(effective)
+        return page
 
     def page_size(self, index: int) -> tuple[float, float]:
         """Taille affichée de la page en points (rotation appliquée)."""
-        r = self.doc[index].rect
+        r = self._slot_page(self._plan[index]).rect
         return r.width, r.height
 
     @property
@@ -115,9 +157,50 @@ class PdfDocument:
     # -- rendu ----------------------------------------------------------------
 
     def render(self, index: int, scale: float, clip: fitz.Rect | None = None) -> fitz.Pixmap:
-        page = self.doc[index]
+        page = self._slot_page(self._plan[index])
         return page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
                                alpha=False, annots=True)
+
+    # -- organisation des pages -------------------------------------------------
+
+    def rotate_page(self, index: int, degrees: int = 90) -> None:
+        slot = self._plan[index]
+        slot.rotation_delta = (slot.rotation_delta + degrees) % 360
+
+    def rotate_all_pages(self, degrees: int = 90) -> None:
+        for slot in self._plan:
+            slot.rotation_delta = (slot.rotation_delta + degrees) % 360
+
+    def delete_page(self, index: int) -> None:
+        if len(self._plan) <= 1:
+            raise PdfError("Impossible de supprimer la seule page du document.")
+        del self._plan[index]
+
+    def insert_pdf(self, index: int, path: str | os.PathLike) -> int:
+        """Insère les pages de `path` après la page `index`. Renvoie leur nombre."""
+        path = Path(path)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise PdfError(f"Impossible de lire le fichier :\n{path}\n\n{exc.strerror or exc}")
+        try:
+            extra = fitz.open(stream=raw, filetype="pdf")
+        except Exception:
+            raise PdfError(f"Ce fichier n'est pas un PDF valide ou il est endommagé :\n{path.name}")
+        if not extra.is_pdf or extra.page_count == 0:
+            raise PdfError(f"Ce fichier ne contient aucune page PDF utilisable :\n{path.name}")
+        if extra.needs_pass:
+            raise PdfError(
+                f"Ce document est protégé par un mot de passe ; il ne peut pas être inséré :\n{path.name}")
+
+        sid = self._next_source
+        self._next_source += 1
+        self._extra_docs[sid] = extra
+        self._extra_sources[sid] = raw
+        new_slots = [PageSlot(source=sid, index=i, base_rotation=extra[i].rotation)
+                    for i in range(extra.page_count)]
+        self._plan[index + 1:index + 1] = new_slots
+        return len(new_slots)
 
     # -- production du document signé ----------------------------------------
 
@@ -127,9 +210,26 @@ class PdfDocument:
             raise PdfError("Impossible de déverrouiller le document pour l'enregistrer.")
         return doc
 
+    def _assemble_plan(self) -> fitz.Document:
+        """Reconstruit un document neuf dans l'ordre et la rotation du plan courant."""
+        out = fitz.open()
+        sources: dict[int, fitz.Document] = {0: self._fresh_copy()}
+        for sid, raw in self._extra_sources.items():
+            sources[sid] = fitz.open(stream=raw, filetype="pdf")
+        try:
+            for slot in self._plan:
+                out.insert_pdf(sources[slot.source], from_page=slot.index, to_page=slot.index)
+                effective = (slot.base_rotation + slot.rotation_delta) % 360
+                if effective:
+                    out[-1].set_rotation(effective)
+        finally:
+            for d in sources.values():
+                d.close()
+        return out
+
     def build_signed(self, placements: list[Placement], renderer: BlockRenderer) -> fitz.Document:
         """Copie en mémoire avec les signatures (pour l'impression)."""
-        doc = self._fresh_copy()
+        doc = self._assemble_plan() if self.is_edited else self._fresh_copy()
         apply_placements(doc, placements, renderer)
         return doc
 
@@ -144,10 +244,14 @@ class PdfDocument:
             raise PdfError(f"Impossible d'écrire dans le dossier :\n{folder}\n\n{exc.strerror or exc}")
         tmp = Path(tmp_name)
         try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(self._data)
-            if not self._save_incremental(tmp, placements, renderer):
-                self._save_full(tmp, placements, renderer)
+            if self.is_edited:
+                os.close(fd)
+                self._save_rebuilt(tmp, placements, renderer)
+            else:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(self._data)
+                if not self._save_incremental(tmp, placements, renderer):
+                    self._save_full(tmp, placements, renderer)
             self._verify(tmp)
             try:
                 os.replace(tmp, target)
@@ -180,6 +284,16 @@ class PdfDocument:
 
     def _save_full(self, tmp: Path, placements, renderer) -> None:
         doc = self._fresh_copy()
+        try:
+            apply_placements(doc, placements, renderer)
+            encryption = fitz.PDF_ENCRYPT_KEEP if self.is_encrypted else fitz.PDF_ENCRYPT_NONE
+            doc.save(tmp, garbage=1, deflate=True, encryption=encryption)
+        finally:
+            doc.close()
+
+    def _save_rebuilt(self, tmp: Path, placements, renderer) -> None:
+        """Pages tournées, supprimées ou insérées : pas d'enregistrement incrémental possible."""
+        doc = self._assemble_plan()
         try:
             apply_placements(doc, placements, renderer)
             encryption = fitz.PDF_ENCRYPT_KEEP if self.is_encrypted else fitz.PDF_ENCRYPT_NONE

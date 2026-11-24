@@ -21,6 +21,21 @@ La flèche à côté de **Signer** donne accès à : *Signature manuscrite seule
 *Modifier ma signature…*. La flèche à côté d'**Enregistrer** permet de *Remplacer le fichier
 original* (avec confirmation).
 
+### Organiser les pages
+
+Le bouton **⟳** (et sa flèche) donne accès à :
+
+- **Tourner** la page courante, dans un sens ou dans l'autre ;
+- **Tourner toutes les pages**, utile pour un scan entièrement de travers ;
+- **Supprimer la page** courante (avec confirmation ; impossible sur la dernière page restante) ;
+- **Insérer un PDF après cette page**, pour ajouter les pages d'un autre fichier à la suite.
+
+Ces opérations retirent les signatures posées mais pas encore enregistrées (après
+confirmation) ; faites-les avant de signer. Elles ne sont pas disponibles sur un document
+protégé par mot de passe. Dès que des pages ont été tournées, supprimées ou insérées,
+l'enregistrement reconstruit le document (l'enregistrement incrémental ne s'applique qu'à
+l'ajout d'une signature seule).
+
 ### Texte de la signature
 
 Ligne libre, par exemple `Lu et approuvé, le {date}`.
@@ -41,6 +56,8 @@ texte au-dessus de la signature, ou à sa gauche. Le texte est inséré comme du
 | Ouvrir / Enregistrer / Imprimer | `Ctrl+O` / `Ctrl+S` / `Ctrl+P` |
 | Signer                       | `Ctrl+E`                          |
 | Annuler la dernière signature | `Ctrl+Z`                         |
+| Tourner la page / sens inverse | `Ctrl+R` / `Ctrl+Maj+R`         |
+| Supprimer la page            | `Ctrl+Maj+Suppr`                  |
 | Page suivante / précédente   | `Pg suiv` / `Pg préc` (ou `→` / `←`) |
 | Première / dernière page     | `Début` / `Fin`                   |
 | Zoom                         | `Ctrl+molette`, `Ctrl++`, `Ctrl+-` |

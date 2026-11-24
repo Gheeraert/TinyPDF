@@ -248,6 +248,80 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(PdfError):
             PdfDocument.open(bad)
 
+    # -- organisation des pages ------------------------------------------------
+
+    def test_rotate_page(self):
+        src = fitz.open()
+        src.new_page(width=595, height=842).insert_text((60, 60), "Page 1")
+        src.new_page(width=595, height=842).insert_text((60, 60), "Page 2")
+        path = self.write(src, "rotate.pdf")
+        pdf = PdfDocument.open(path)
+        self.assertEqual(pdf.page_size(0), (595, 842))
+        pdf.rotate_page(0, 90)
+        self.assertEqual(pdf.page_size(0), (842, 595))
+        self.assertTrue(pdf.is_edited)
+        out = pdf.save(self.tmp / "rotate_s.pdf", [], self.renderer)
+        doc = fitz.open(out)
+        self.assertEqual(doc[0].rotation, 90)
+        self.assertEqual(doc[1].rotation, 0)
+        self.assertEqual(doc.page_count, 2)
+
+    def test_rotate_all_pages(self):
+        src = fitz.open()
+        for _ in range(2):
+            src.new_page(width=595, height=842)
+        path = self.write(src, "rotate_all.pdf")
+        pdf = PdfDocument.open(path)
+        pdf.rotate_all_pages(90)
+        out = pdf.save(self.tmp / "rotate_all_s.pdf", [], self.renderer)
+        doc = fitz.open(out)
+        self.assertTrue(all(p.rotation == 90 for p in doc))
+
+    def test_delete_page(self):
+        src = fitz.open()
+        for i in range(3):
+            src.new_page().insert_text((72, 72), f"Page {i + 1}")
+        path = self.write(src, "delete.pdf")
+        pdf = PdfDocument.open(path)
+        pdf.delete_page(1)
+        self.assertEqual(pdf.page_count, 2)
+        out = pdf.save(self.tmp / "delete_s.pdf", [], self.renderer)
+        doc = fitz.open(out)
+        self.assertEqual(doc.page_count, 2)
+        self.assertIn("Page 1", doc[0].get_text())
+        self.assertIn("Page 3", doc[1].get_text())
+        # L'original n'est pas touché.
+        self.assertEqual(fitz.open(path).page_count, 3)
+
+    def test_delete_last_remaining_page_refused(self):
+        src = fitz.open()
+        src.new_page()
+        path = self.write(src, "single.pdf")
+        pdf = PdfDocument.open(path)
+        with self.assertRaises(PdfError):
+            pdf.delete_page(0)
+
+    def test_insert_pdf(self):
+        a = fitz.open()
+        a.new_page().insert_text((72, 72), "A1")
+        a.new_page().insert_text((72, 72), "A2")
+        path_a = self.write(a, "a.pdf")
+
+        b = fitz.open()
+        b.new_page().insert_text((72, 72), "B1")
+        path_b = self.write(b, "b.pdf")
+
+        pdf = PdfDocument.open(path_a)
+        n = pdf.insert_pdf(0, path_b)
+        self.assertEqual(n, 1)
+        self.assertEqual(pdf.page_count, 3)
+        out = pdf.save(self.tmp / "insert_s.pdf", [], self.renderer)
+        doc = fitz.open(out)
+        self.assertEqual(doc.page_count, 3)
+        self.assertIn("A1", doc[0].get_text())
+        self.assertIn("B1", doc[1].get_text())
+        self.assertIn("A2", doc[2].get_text())
+
     def test_save_overwrite_original(self):
         src = fitz.open()
         src.new_page()

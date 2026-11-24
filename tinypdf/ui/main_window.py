@@ -118,6 +118,13 @@ class MainWindow(QMainWindow):
         self.act_edit_sig = self._action("Modifier ma signature…", self.edit_signature)
         self.act_undo = self._action("Annuler", self.undo, QKeySequence.Undo,
                                      "Retirer la dernière signature posée")
+        self.act_rotate_cw = self._action("Tourner", lambda: self.rotate_page(90), "Ctrl+R",
+                                          "Tourner la page courante (sens horaire)")
+        self.act_rotate_ccw = self._action("Tourner (sens inverse)", lambda: self.rotate_page(-90),
+                                           "Ctrl+Shift+R")
+        self.act_rotate_all = self._action("Tourner toutes les pages", self.rotate_all_pages)
+        self.act_delete_page = self._action("Supprimer la page", self.delete_page, "Ctrl+Shift+Delete")
+        self.act_insert_pdf = self._action("Insérer un PDF après cette page…", self.insert_pdf)
         self.act_prev = self._action("Page précédente", lambda: self.view.previous_page())
         self.act_next = self._action("Page suivante", lambda: self.view.next_page())
         self.act_zoom_in = self._action("Zoom avant", lambda: self.view.zoom_by(1.25),
@@ -138,6 +145,8 @@ class MainWindow(QMainWindow):
         self.act_next.setText("›")
         self.act_next.setToolTip("Page suivante (Pg suiv)")
 
+        self.act_rotate_cw.setText("⟳")
+
     def _build_toolbar(self) -> None:
         tb = QToolBar("Outils", self)
         tb.setMovable(False)
@@ -150,6 +159,12 @@ class MainWindow(QMainWindow):
         save_btn = self._menu_button(self.act_save, [self.act_overwrite])
         tb.addWidget(save_btn)
         tb.addAction(self.act_print)
+        tb.addSeparator()
+
+        pages_btn = self._menu_button(self.act_rotate_cw, [self.act_rotate_ccw, self.act_rotate_all,
+                                                            None, self.act_delete_page,
+                                                            None, self.act_insert_pdf])
+        tb.addWidget(pages_btn)
         tb.addSeparator()
 
         sign_btn = self._menu_button(self.act_sign, [self.act_sign_image, self.act_sign_text,
@@ -211,15 +226,22 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ état
 
+    def _is_dirty(self) -> bool:
+        return self.pdf is not None and (self.view.has_placements() or self.pdf.is_edited)
+
     def _update_state(self) -> None:
         has_doc = self.pdf is not None
-        dirty = self.view.has_placements()
+        dirty = self._is_dirty()
         for a in (self.act_print, self.act_prev, self.act_next, self.act_zoom_in,
                   self.act_zoom_out, self.act_fit_width, self.act_fit_page):
             a.setEnabled(has_doc)
         self.act_save.setEnabled(has_doc)
         self.act_overwrite.setEnabled(has_doc and dirty)
-        self.act_undo.setEnabled(dirty or self.view.is_placing())
+        self.act_undo.setEnabled(self.view.has_placements() or self.view.is_placing())
+        can_edit_pages = has_doc and not self.pdf.is_encrypted
+        for a in (self.act_rotate_cw, self.act_rotate_ccw, self.act_rotate_all, self.act_insert_pdf):
+            a.setEnabled(can_edit_pages)
+        self.act_delete_page.setEnabled(can_edit_pages and self.pdf.page_count > 1)
         self.page_spin.setEnabled(has_doc)
         self.zoom_combo.setEnabled(has_doc)
         title = APP_NAME
@@ -316,12 +338,12 @@ class MainWindow(QMainWindow):
         """True si l'on peut abandonner le document courant."""
         if self.view.is_placing():
             self.view.cancel_placement()
-        if self.pdf is None or not self.view.has_placements():
+        if self.pdf is None or not self._is_dirty():
             return True
         box = QMessageBox(QMessageBox.Question, APP_NAME,
-                          "Les signatures apposées n'ont pas été enregistrées.",
+                          "Ce document comporte des modifications non enregistrées.",
                           QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, self)
-        box.setInformativeText("Voulez-vous enregistrer le document signé ?")
+        box.setInformativeText("Voulez-vous enregistrer le document ?")
         box.setDefaultButton(QMessageBox.Save)
         choice = box.exec()
         if choice == QMessageBox.Save:
@@ -342,8 +364,8 @@ class MainWindow(QMainWindow):
     def save(self) -> bool:
         if self.pdf is None:
             return False
-        if not self.view.has_placements():
-            self.statusBar().showMessage("Aucune signature à enregistrer : cliquez d'abord sur « Signer ».", 6000)
+        if not self._is_dirty():
+            self.statusBar().showMessage("Rien à enregistrer.", 4000)
             return False
         path, _ = QFileDialog.getSaveFileName(self, "Enregistrer le PDF signé",
                                               str(self._default_save_path()), "Documents PDF (*.pdf)")
@@ -357,7 +379,7 @@ class MainWindow(QMainWindow):
         return self._write(target)
 
     def overwrite_original(self) -> bool:
-        if self.pdf is None or not self.view.has_placements():
+        if self.pdf is None or not self._is_dirty():
             return False
         if not self._confirm_overwrite_original():
             return False
@@ -464,6 +486,76 @@ class MainWindow(QMainWindow):
     def undo(self) -> None:
         if not self.view.undo_last():
             self.statusBar().showMessage("Rien à annuler.", 3000)
+
+    # ------------------------------------------------------------------ pages
+
+    def _guard_pages_edit(self) -> bool:
+        """Confirme le retrait des signatures non enregistrées avant une opération de page."""
+        if self.pdf is None:
+            return False
+        if self.view.is_placing():
+            self.view.cancel_placement()
+        if self.pdf.is_encrypted:
+            QMessageBox.warning(self, "Modifier les pages",
+                                "Cette opération n'est pas disponible pour un document "
+                                "protégé par mot de passe.")
+            return False
+        if not self.view.has_placements():
+            return True
+        answer = QMessageBox.question(
+            self, "Modifier les pages",
+            "Cette opération retire les signatures posées mais non enregistrées.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        return answer == QMessageBox.Yes
+
+    def _apply_page_edit(self) -> None:
+        self.view.set_document(self.pdf, keep_position=True)
+        self._update_state()
+
+    def rotate_page(self, degrees: int = 90) -> None:
+        if not self._guard_pages_edit():
+            return
+        self.pdf.rotate_page(self.view.current_page(), degrees)
+        self._apply_page_edit()
+
+    def rotate_all_pages(self) -> None:
+        if not self._guard_pages_edit():
+            return
+        self.pdf.rotate_all_pages(90)
+        self._apply_page_edit()
+
+    def delete_page(self) -> None:
+        if not self._guard_pages_edit():
+            return
+        if self.pdf.page_count <= 1:
+            QMessageBox.warning(self, "Supprimer la page",
+                                "Impossible de supprimer la seule page du document.")
+            return
+        index = self.view.current_page()
+        answer = QMessageBox.question(
+            self, "Supprimer la page", f"Supprimer la page {index + 1} ?",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer != QMessageBox.Yes:
+            return
+        self.pdf.delete_page(index)
+        self._apply_page_edit()
+
+    def insert_pdf(self) -> None:
+        if not self._guard_pages_edit():
+            return
+        start = self.settings.get("last_open_dir") or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, "Insérer un PDF après cette page", start,
+                                              "Documents PDF (*.pdf);;Tous les fichiers (*)")
+        if not path:
+            return
+        try:
+            with busy():
+                n = self.pdf.insert_pdf(self.view.current_page(), path)
+        except PdfError as exc:
+            QMessageBox.warning(self, "Insérer un PDF", str(exc))
+            return
+        self._apply_page_edit()
+        self.statusBar().showMessage(f"{n} page(s) insérée(s).", 5000)
 
     # ------------------------------------------------------------------ impression
 
